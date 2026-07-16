@@ -55,7 +55,11 @@ func (chunk *DataChunk) GetValue(colIdx, rowIdx int) (any, error) {
 	}
 
 	column := &chunk.columns[colIdx]
-	return column.getFn(column, mapping.IdxT(rowIdx)), nil
+	value, err := column.getFn(column, mapping.IdxT(rowIdx))
+	if err != nil {
+		return nil, getError(errAPI, addIndexToError(err, colIdx))
+	}
+	return value, nil
 }
 
 // SetValue writes a single value to a column in a data chunk.
@@ -71,9 +75,7 @@ func (chunk *DataChunk) SetValue(colIdx, rowIdx int, val any) error {
 	}
 
 	column := &chunk.columns[colIdx]
-
-	err = column.setFn(column, mapping.IdxT(rowIdx), val)
-	if err != nil {
+	if err = column.SetValue(rowIdx, val); err != nil {
 		return setValueError(colIdx, rowIdx, val, err)
 	}
 

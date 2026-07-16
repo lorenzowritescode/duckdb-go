@@ -720,12 +720,13 @@ func TestErrScalarUDF(t *testing.T) {
 	err = RegisterScalarUDF(conn, "my_sum", udf)
 	require.NoError(t, err)
 	err = RegisterScalarUDF(conn, "my_sum", udf)
-	testError(t, err, errAPI.Error(), errScalarUDFCreate.Error())
+	require.NoError(t, err)
 
 	// Register a scalar function whose name already exists.
+	// Since DuckDB 1.5.0, duplicate names add overloads instead of erroring.
 	var errDuplicateUDF *simpleSUDF
 	err = RegisterScalarUDF(conn, "my_sum", errDuplicateUDF)
-	testError(t, err, errAPI.Error(), errScalarUDFCreate.Error())
+	require.NoError(t, err)
 
 	// Register a scalar function that is nil.
 	err = RegisterScalarUDF(conn, "my_sum", nil)
@@ -762,15 +763,17 @@ func (*chunkSumSUDF) Config() ScalarFuncConfig {
 
 func (*chunkSumSUDF) Executor() ScalarFuncExecutor {
 	return ScalarFuncExecutor{
-		ChunkContextExecutor: func(ctx context.Context, chunk *ScalarUDFChunk) error {
-			rows, onFinish := chunk.Rows()
-			for row := range rows {
-				result := row.Args[0].(int32) + row.Args[1].(int32)
-				if err := row.SetResult(result); err != nil {
+		ChunkContextExecutor: func(ctx context.Context, chunk *ChunkIteratorState) error {
+			for row, err := range chunk.Rows() {
+				if err != nil {
+					return err
+				}
+				res := (*row.GetValuePtr(0)).(int32) + (*row.GetValuePtr(1)).(int32)
+				if err = row.SetResult(res); err != nil {
 					return err
 				}
 			}
-			return onFinish()
+			return nil
 		},
 	}
 }
@@ -779,51 +782,70 @@ func (*chunkContextSUDF) Config() ScalarFuncConfig {
 	return ScalarFuncConfig{[]TypeInfo{}, currentInfo, nil, true, false}
 }
 
+func bindChunkExecutor(parentCtx context.Context, args []ScalarUDFArg) (context.Context, error) {
+	bindCtx := context.WithValue(parentCtx, testBindCtxKey, uint64(42))
+	return bindCtx, nil
+}
+
 func (*chunkContextSUDF) Executor() ScalarFuncExecutor {
 	return ScalarFuncExecutor{
-		ChunkContextExecutor: func(ctx context.Context, chunk *ScalarUDFChunk) error {
+		ScalarBinder: bindChunkExecutor,
+		ChunkContextExecutor: func(ctx context.Context, chunk *ChunkIteratorState) error {
 			if ctx == nil {
 				return errors.New("context is nil for chunkContextSUDF")
 			}
 
-			id, ok := ctx.Value(testCtxKey).(uint64)
+			connId, ok := ctx.Value(testCtxKey).(uint64)
 			if !ok {
 				return errors.New("context does not contain the connection id for chunkContextSUDF")
 			}
 
-			rows, onFinish := chunk.Rows()
-			for row := range rows {
-				if err := row.SetResult(id); err != nil {
+			bindId, ok := ctx.Value(testBindCtxKey).(uint64)
+			if !ok {
+				return errors.New("context does not contain the bind id for chunkContextSUDF")
+			}
+
+			for row, err := range chunk.Rows() {
+				if err != nil {
+					return err
+				}
+				if err = row.SetResult(connId + bindId); err != nil {
 					return err
 				}
 			}
-			return onFinish()
+			return nil
 		},
 	}
 }
 
 func (*chunkNullHandlingSUDF) Config() ScalarFuncConfig {
 	// SpecialNullHandling: true means user handles NULLs manually
-	return ScalarFuncConfig{[]TypeInfo{currentInfo}, currentInfo, nil, false, true}
+	return ScalarFuncConfig{[]TypeInfo{currentInfo, currentInfo}, currentInfo, nil, false, true}
 }
 
 func (*chunkNullHandlingSUDF) Executor() ScalarFuncExecutor {
 	return ScalarFuncExecutor{
-		ChunkContextExecutor: func(ctx context.Context, chunk *ScalarUDFChunk) error {
-			rows, onFinish := chunk.Rows()
-			for row := range rows {
-				val := row.Args[0]
-				if val == nil {
-					if err := row.SetResult(int32(-1)); err != nil {
-						return err
-					}
-				} else {
-					if err := row.SetResult(val.(int32) * 2); err != nil {
-						return err
-					}
+		ChunkContextExecutor: func(ctx context.Context, chunk *ChunkIteratorState) error {
+			columnCount := chunk.ColumnCount()
+			for row, err := range chunk.Rows() {
+				if err != nil {
+					return err
+				}
+				val1 := row.GetValuePtr(columnCount - 2)
+				val2 := row.GetValuePtr(columnCount - 1)
+				res := int32(-1)
+				if *val1 != nil && *val2 != nil {
+					res = (*val1).(int32) + (*val2).(int32)
+				} else if *val1 != nil {
+					res = (*val1).(int32)
+				} else if *val2 != nil {
+					res = (*val2).(int32)
+				}
+				if err = row.SetResult(res); err != nil {
+					return err
 				}
 			}
-			return onFinish()
+			return nil
 		},
 	}
 }
@@ -834,7 +856,7 @@ func (*chunkErrorSUDF) Config() ScalarFuncConfig {
 
 func (*chunkErrorSUDF) Executor() ScalarFuncExecutor {
 	return ScalarFuncExecutor{
-		ChunkContextExecutor: func(ctx context.Context, chunk *ScalarUDFChunk) error {
+		ChunkContextExecutor: func(ctx context.Context, chunk *ChunkIteratorState) error {
 			return errors.New("test chunk execution error")
 		},
 	}
@@ -859,14 +881,14 @@ func TestChunkScalarUDF(t *testing.T) {
 	_, err = db.Exec(`CREATE TABLE test_chunk AS SELECT i::INTEGER AS a, (i * 2)::INTEGER AS b FROM range(100) t(i)`)
 	require.NoError(t, err)
 
-	rows, err := db.Query(`SELECT a, b, chunk_sum(a, b) AS sum FROM test_chunk`)
+	res, err := db.Query(`SELECT a, b, chunk_sum(a, b) AS sum FROM test_chunk`)
 	require.NoError(t, err)
-	defer closeRowsWrapper(t, rows)
+	defer closeRowsWrapper(t, res)
 
 	count := 0
-	for rows.Next() {
+	for res.Next() {
 		var a, b, sum int32
-		require.NoError(t, rows.Scan(&a, &b, &sum))
+		require.NoError(t, res.Scan(&a, &b, &sum))
 		require.Equal(t, a+b, sum)
 		count++
 	}
@@ -907,10 +929,14 @@ func TestChunkScalarUDFSpecialNullHandling(t *testing.T) {
 	db := openDbWrapper(t, ``)
 	defer closeDbWrapper(t, db)
 
+	// Create a table for consecutive rows.
+	createTable(t, db, `CREATE TABLE foo(bar INTEGER, baz INTEGER)`)
+	_, err := db.Exec(`INSERT INTO foo VALUES (42, 43), (NULL, 1), (100, NULL), (300, 400), (NULL, NULL)`)
+	require.NoError(t, err)
+
 	conn := openConnWrapper(t, db, context.Background())
 	defer closeConnWrapper(t, conn)
 
-	var err error
 	currentInfo, err = NewTypeInfo(TYPE_INTEGER)
 	require.NoError(t, err)
 
@@ -919,14 +945,19 @@ func TestChunkScalarUDFSpecialNullHandling(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test user-managed NULL handling.
-	var result int32
-	row := db.QueryRow(`SELECT chunk_null_handler(5)`)
-	require.NoError(t, row.Scan(&result))
-	require.Equal(t, int32(10), result)
+	res, err := db.Query(`SELECT chunk_null_handler(bar, baz) FROM foo`)
+	require.NoError(t, err)
+	defer closeRowsWrapper(t, res)
 
-	row = db.QueryRow(`SELECT chunk_null_handler(NULL)`)
-	require.NoError(t, row.Scan(&result))
-	require.Equal(t, int32(-1), result)
+	var output int32
+	i := 0
+	expected := []int32{85, 1, 100, 700, -1}
+	for res.Next() {
+		err = res.Scan(&output)
+		require.NoError(t, err)
+		require.Equal(t, expected[i], output)
+		i++
+	}
 }
 
 func TestChunkScalarUDFContext(t *testing.T) {
@@ -947,10 +978,10 @@ func TestChunkScalarUDFContext(t *testing.T) {
 
 	ctx := context.WithValue(context.Background(), testCtxKey, connId)
 
-	var result uint64
+	var res uint64
 	row := conn.QueryRowContext(ctx, `SELECT chunk_get_conn_id()`)
-	require.NoError(t, row.Scan(&result))
-	require.Equal(t, connId, result)
+	require.NoError(t, row.Scan(&res))
+	require.Equal(t, connId+42, res)
 }
 
 func TestChunkScalarUDFError(t *testing.T) {
